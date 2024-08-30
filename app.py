@@ -1,64 +1,67 @@
+import os
 import streamlit as st
+from langchain_huggingface.embeddings import HuggingFaceEmbeddings
+from langchain_chroma import Chroma
+from langchain import hub
 from langchain_community.document_loaders import GithubFileLoader
-from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain_community.vectorstores import Chroma
-from langchain_community.embeddings import GPT4AllEmbeddings
-# from langchain_community.retrievers import FAISS
-# Define the GitHub repository details
-repo = "panaversity/learn-applied-generative-ai-fundamentals"
-branch = "main"
-access_token = ""  # Replace with your actual GitHub personal access token
-github_api_url = "https://api.github.com"
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_core.output_parsers import StrOutputParser
+from langchain_core.runnables import RunnablePassthrough
+from langchain_google_genai import ChatGoogleGenerativeAI
 
-# Load documents from the GitHub repository
+# Environment Variables
+GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
+GITHUB_PERSONAL_ACCESS_TOKEN = os.getenv("GITHUB_PERSONAL_ACCESS_TOKEN")
+if not GOOGLE_API_KEY:
+    raise ValueError("GOOGLE_API_KEY environment variable is not set.")
+
+# Loading Github Repo
 loader = GithubFileLoader(
-    repo=repo,  # the repo name
-    branch=branch,  # the branch name
-    access_token=access_token,
-    github_api_url=github_api_url,
-    file_filter=lambda file_path: file_path.endswith(".md"),  # load all markdown files.
+    repo="panaversity/learn-applied-generative-ai-fundamentals",
+    branch="main",
+    access_token=GITHUB_PERSONAL_ACCESS_TOKEN,
+    github_api_url="https://api.github.com",
+    file_filter=lambda file_path: file_path.endswith(".md"),
 )
-documents = loader.load()
+docs = loader.load()
 
-# Split the documents into chunks
-text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
-splits = text_splitter.split_documents(documents)
+# Splitting
+text_splitter = RecursiveCharacterTextSplitter(chunk_size=100, chunk_overlap=20)
+splits = text_splitter.split_documents(docs)
 
-# Initialize GPT4All embeddings
-embeddings_model = GPT4AllEmbeddings()
+# Create Embeddings and Vectorstore
+embeddings = HuggingFaceEmbeddings()
+vectorstore = Chroma.from_documents(documents=splits, embedding=embeddings)
 
-# Precompute the embeddings for the document chunks
-embeddings = [embeddings_model.embed(chunk.page_content) for chunk in splits]
-print(embeddings)
+# Retrieve and generate using the relevant snippets
+retriever = vectorstore.as_retriever(
+    search_type="similarity_score_threshold", search_kwargs={"score_threshold": 0.2}
+)
+prompt = hub.pull("rlm/rag-prompt")
 
-# Create a vector store from the chunks
-# vectorstore = FAISS.from_embeddings(embeddings=embeddings, texts=[chunk.page_content for chunk in splits])
+# Initialize LLM
+llm = ChatGoogleGenerativeAI(model="gemini-1.5-flash", google_api_key=GOOGLE_API_KEY)
 
-# # Initialize the retriever
-# retriever = vectorstore.as_retriever(search_type="similarity", search_kwargs={"k": 6})
+# Define Streamlit Interface
+st.title('Panaversity Generative AI Fundamentals')
+st.write("Enter your query below:")
 
-# # Streamlit UI
-# st.title('LangChain Document Chunks with GPT4All')
-# st.write('Below are the text chunks generated from the documents in the GitHub repository.')
+user_query = st.text_input("Query", "")
 
-# for i, chunk in enumerate(splits):
-#     st.subheader(f'Chunk {i+1}')
-#     st.write(chunk.page_content)
+if user_query:
+    # Processing Query
+    docs = retriever.invoke(user_query)
+    formatted_docs = "\n\n".join(doc.page_content for doc in docs)
+    context=formatted_docs
+    # Construct the RAG Chain
+    rag_chain = (
+        {"context": lambda x: context, "question": RunnablePassthrough()}
+        | prompt
+        | llm
+        | StrOutputParser()
+    )
 
-# # Testing specific query
-# query = "What are the approaches to Task Decomposition?"
-# retrieved_docs = retriever.invoke(query)
-
-# st.subheader('Search Results for the query: "What are the approaches to Task Decomposition?"')
-# if retrieved_docs:
-#     for i, doc in enumerate(retrieved_docs):
-#         st.write(f"Result {i+1}: {doc.page_content}")
-# else:
-#     st.write("No results found.")
-
-# # Display length of retrieved documents
-# st.write(f"Number of retrieved documents: {len(retrieved_docs)}")
-
-# # Print the content of the first retrieved document for verification
-# if retrieved_docs:
-#     st.write(f"Content of the first retrieved document: {retrieved_docs[0].page_content}")
+    # Invoke the chain
+    response = rag_chain.invoke({"context": formatted_docs, "question": user_query})
+    st.write("Response:")
+    st.write(response)
